@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mapa — Gradiente/Discreto + Daltônico (CSV local)</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- PapaParse -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <style>
+    :root {
+      --panel-bg: rgba(255,255,255,0.94);
+      --panel-bd: rgba(148,163,184,0.35);
+      --text-muted: #6b7280;
+      --text-strong: #0f172a;
+    }
+    html, body, #map { height: 100%; margin: 0; }
+    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial; color: var(--text-strong); }
+
+    .panel {
+      position: fixed; z-index: 9999; pointer-events: auto;
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-bd);
+      border-radius: 12px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.12);
+      padding: 10px 12px;
+      backdrop-filter: blur(4px);
+    }
+    #controls { top: 12px; left: 12px; width: min(360px, 92vw); display: grid; gap: 10px; }
+    label { font-size: 12px; color: #475569; }
+    select, input[type="file"], input[type="range"], input[type="checkbox"], button.tiny {
+      font-size: 13px; padding: 6px 8px; border-radius: 10px; border: 1px solid #e5e7eb; background: #fff;
+    }
+    button.tiny { font-size: 11px; padding: 2px 6px; border-radius: 999px; }
+    .row { display: grid; gap: 6px; }
+    .row-inline { display:flex; align-items:center; gap: 10px; flex-wrap: wrap; }
+    .muted { color: var(--text-muted); font-size: 12px; }
+
+    /* Legenda do gradiente (canto inferior esquerdo) */
+    #legendGrad {
+      position: fixed; bottom: 12px; left: 12px;
+      display: grid; gap: 8px; min-width: 260px;
+      z-index: 9998;
+    }
+    .gradBar {
+      height: 12px; border-radius: 999px; border: 1px solid var(--panel-bd);
+    }
+    .legend-labels {
+      display:flex; justify-content: space-between; font-size: 12px; color:#334155;
+    }
+
+    /* Legenda discreta (centro inferior) */
+    #legendDisc {
+      position: fixed; bottom: 12px; left: 50%;
+      transform: translateX(-50%);
+      display: none; /* trocada via JS */
+      z-index: 9998;
+    }
+    .legend-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 18px;
+      text-align: center;
+      padding: 8px 10px;
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-bd);
+      border-radius: 12px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.12);
+    }
+    .legend-col { display:grid; gap: 6px; justify-items:center; }
+    .swatch-lg {
+      width: 52px; height: 12px; border-radius: 8px; border: 1px solid rgba(0,0,0,0.25);
+    }
+    .pct { font-size: 12px; color: var(--text-strong); min-width: 52px; }
+
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="controls" class="panel">
+    <div class="row">
+      <label>Carregar CSV (<code>city, lat, lon, score, ramo, uf, capital</code>)</label>
+      <input id="fileInput" type="file" accept=".csv" />
+      <div class="muted">Use <b>Gradiente</b> (escala contínua, contraste robusto) ou <b>Discreto</b> (4 classes 1–4 com %).</div>
+    </div>
+
+    <div class="row">
+      <label>Ramo</label>
+      <select id="ramoSelect" disabled></select>
+    </div>
+
+    <div class="row">
+      <div class="row-inline" style="justify-content: space-between;">
+        <label>Estados</label>
+        <div class="row-inline" style="gap:6px;">
+          <button id="btnSelTodos" class="tiny">Selecionar todos</button>
+          <button id="btnLimpar" class="tiny">Limpar</button>
+        </div>
+      </div>
+      <select id="estadoMulti" multiple size="6" style="width:100%;"></select>
+    </div>
+
+    <div class="row-inline">
+      <label class="muted">Somente capitais</label>
+      <input id="capitaisOnly" type="checkbox" disabled />
+      <div style="flex:1;"></div>
+      <label class="muted">Gradiente</label>
+      <input id="isGradient" type="checkbox" checked />
+      <label class="muted">Daltônico</label>
+      <input id="isColorblind" type="checkbox" />
+    </div>
+
+    <div class="row-inline">
+      <label for="sizeRange" class="muted">Tamanho</label>
+      <input id="sizeRange" type="range" min="3" max="14" value="8" />
+      <div style="flex:1;"></div>
+      <span id="countLabel" class="muted">— pts</span>
+      <span id="avgLabel" class="muted">média —</span>
+    </div>
+  </div>
+
+  <!-- Legenda Gradiente -->
+  <div id="legendGrad" class="panel">
+    <div class="gradBar" id="gradBar"></div>
+    <div class="legend-labels">
+      <span id="minLabel">min —</span>
+      <span id="medLabel">p50 —</span>
+      <span id="maxLabel">max —</span>
+    </div>
+  </div>
+
+  <!-- Legenda Discreta (4 cores com % embaixo) -->
+  <div id="legendDisc">
+    <div class="legend-grid">
+      <div class="legend-col">
+        <div class="swatch-lg" id="swL1" title="Classe 1"></div>
+        <div class="pct" id="pct1">—%</div>
+      </div>
+      <div class="legend-col">
+        <div class="swatch-lg" id="swL2" title="Classe 2"></div>
+        <div class="pct" id="pct2">—%</div>
+      </div>
+      <div class="legend-col">
+        <div class="swatch-lg" id="swL3" title="Classe 3"></div>
+        <div class="pct" id="pct3">—%</div>
+      </div>
+      <div class="legend-col">
+        <div class="swatch-lg" id="swL4" title="Classe 4"></div>
+        <div class="pct" id="pct4">—%</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ================== Paletas ==================
+    function hexToRgb(hex){ const h=hex.replace('#',''); const v=parseInt(h,16); return [(v>>16)&255,(v>>8)&255,v&255]; }
+    function lerp(a,b,t){ return a + (b-a)*t; }
+    function lerpColorRGB(c1,c2,t){ return `rgb(${Math.round(lerp(c1[0],c2[0],t))},${Math.round(lerp(c1[1],c2[1],t))},${Math.round(lerp(c1[2],c2[2],t))})`; }
+    function colorStops(stops){
+      return function(t){
+        t = Math.max(0, Math.min(1, t));
+        for (let i=0;i<stops.length-1;i++){
+          const [p1,c1]=stops[i], [p2,c2]=stops[i+1];
+          if (t>=p1 && t<=p2){ const f=(t-p1)/(p2-p1); return lerpColorRGB(hexToRgb(c1), hexToRgb(c2), f); }
+        }
+        return stops[t<stops[0][0]?0:stops.length-1][1];
+      }
+    }
+
+    // Gradiente "normal": Azul → Verde → Amarelo → Vermelho
+    const gradNormal = colorStops([
+      [0.00,'#2563eb'], [0.33,'#16a34a'], [0.66,'#eab308'], [1.00,'#dc2626']
+    ]);
+    // Gradiente daltônico (viridis-like)
+    const gradCB = colorStops([
+      [0.00,'#440154'], [0.25,'#39568C'], [0.50,'#1F968B'], [0.75,'#73D055'], [1.00,'#FDE725']
+    ]);
+
+    // Discretas (1..4)
+    const discNormal = {1:'#2563eb',2:'#16a34a',3:'#eab308',4:'#dc2626'};
+    const discCB     = {1:'#440154',2:'#3b528b',3:'#1f9e89',4:'#FDE725'};
+
+    function setGradBar(isCB){
+      const bar = document.getElementById('gradBar');
+      bar.style.background = isCB
+        ? 'linear-gradient(90deg,#440154,#39568C,#1F968B,#73D055,#FDE725)'
+        : 'linear-gradient(90deg,#2563eb,#16a34a,#eab308,#dc2626)';
+    }
+    function setDiscreteSwatches(isCB){
+      const pal = isCB ? discCB : discNormal;
+      document.getElementById('swL1').style.background = pal[1];
+      document.getElementById('swL2').style.background = pal[2];
+      document.getElementById('swL3').style.background = pal[3];
+      document.getElementById('swL4').style.background = pal[4];
+    }
+
+    // ================== Escala robusta (contraste) ==================
+    let allScoresSorted = [];
+    let vmin=null, vmax=null, vmed=null, v02=null, v98=null;
+    function percentile(arrSorted, p){
+      const n = arrSorted.length;
+      if (!n) return NaN;
+      const idx = (n-1)*p;
+      const lo = Math.floor(idx), hi = Math.ceil(idx);
+      if (lo===hi) return arrSorted[lo];
+      const w = idx - lo; return arrSorted[lo]*(1-w) + arrSorted[hi]*w;
+    }
+    function updateDomain(rowsAll){
+      const vals = rowsAll.map(r=>r.score).filter(Number.isFinite).sort((a,b)=>a-b);
+      allScoresSorted = vals;
+      if (!vals.length){ vmin=vmax=vmed=v02=v98=null; return; }
+      vmin = vals[0]; vmax = vals[vals.length-1];
+      vmed = percentile(vals, 0.5);
+      v02  = percentile(vals, 0.02);
+      v98  = percentile(vals, 0.98);
+      document.getElementById('minLabel').textContent = "min " + vmin.toFixed(2);
+      document.getElementById('medLabel').textContent = "p50 " + vmed.toFixed(2);
+      document.getElementById('maxLabel').textContent = "max " + vmax.toFixed(2);
+    }
+    function normRobust(x){
+      if (!Number.isFinite(x) || v02==null || v98==null || v02>=v98) return 0.5;
+      let t = (x - v02) / (v98 - v02);
+      t = Math.max(0, Math.min(1, t));
+      const gamma = 0.75; // aumenta contraste
+      return Math.pow(t, gamma);
+    }
+
+    // ================== Mapa ==================
+    const map = L.map('map', { zoomControl: true, preferCanvas: true }).setView([-14.2350, -51.9253], 4);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; OpenStreetMap &copy; CARTO', subdomains: 'abcd', maxZoom: 20
+    }).addTo(map);
+
+    // panes para garantir capitais no topo
+    map.createPane('noncap'); map.getPane('noncap').style.zIndex = 640;
+    map.createPane('capitals'); map.getPane('capitals').style.zIndex = 650;
+    const nonCapLayer = L.layerGroup([], {pane:'noncap'}).addTo(map);
+    const capLayer    = L.layerGroup([], {pane:'capitals'}).addTo(map);
+
+    // ================== Estado & UI ==================
+    let allRows = [];
+    let pointRadius = 8;
+    const pointOpacity = 0.9;
+    let hasCapital = false;
+    let lastRows = []; // mantém o último conjunto renderizado para atualizar legenda discreta
+
+    const fileInput    = document.getElementById('fileInput');
+    const ramoSelect   = document.getElementById('ramoSelect');
+    const estadoMulti  = document.getElementById('estadoMulti');
+    const btnSelTodos  = document.getElementById('btnSelTodos');
+    const btnLimpar    = document.getElementById('btnLimpar');
+    const sizeRange    = document.getElementById('sizeRange');
+    const capitaisOnly = document.getElementById('capitaisOnly');
+    const countLabel   = document.getElementById('countLabel');
+    const avgLabel     = document.getElementById('avgLabel');
+    const isGradient   = document.getElementById('isGradient');
+    const isColorblind = document.getElementById('isColorblind');
+
+    const legendGrad   = document.getElementById('legendGrad');
+    const legendDisc   = document.getElementById('legendDisc');
+
+    function normalizeKeys(row) {
+      const m = {};
+      Object.keys(row).forEach(k => {
+        const lk = (k || '').toString().trim().toLowerCase();
+        if (["lat","latitude"].includes(lk)) m.lat = row[k];
+        else if (["lon","lng","longitude"].includes(lk)) m.lon = row[k];
+        else if (["city","cidade","municipio","city_name"].includes(lk)) m.city = row[k];
+        else if (["score","pontuacao","nivel_medio"].includes(lk)) m.score = row[k];
+        else if (["ramo","segmento","setor","branch"].includes(lk)) m.ramo = row[k];
+        else if (["estado","uf","state","sigla_uf"].includes(lk)) m.uf = row[k];
+        else if (["capital","is_capital","capital_flag","capital_bool","eh_capital"].includes(lk)) m.capital = row[k];
+      });
+      return m;
+    }
+    function parseBool(v){
+      if (typeof v === "boolean") return v;
+      if (v == null) return false;
+      const s = String(v).trim().toLowerCase();
+      return ["1","true","t","yes","y","sim","s"].includes(s);
+    }
+    function parseRows(raw) {
+      const out = [];
+      for (const r of raw) {
+        const o = normalizeKeys(r);
+        const lat = parseFloat(o.lat), lon = parseFloat(o.lon);
+        const score = parseFloat(o.score);
+        const ramo = (o.ramo ?? '').toString().trim();
+        const city = (o.city ?? '').toString().trim();
+        const uf = (o.uf ?? '').toString().trim().toUpperCase();
+        const capital = parseBool(o.capital);
+        if (Number.isFinite(lat) && Number.isFinite(lon) && Number.isFinite(score) && ramo) {
+          out.push({city, lat, lon, score, ramo, uf, capital});
+        }
+      }
+      return out;
+    }
+    function computeRamos(rows) {
+      const set = new Set(); for (const r of rows) if (r.ramo) set.add(r.ramo);
+      return Array.from(set).sort((a,b)=>a.localeCompare(b));
+    }
+    function computeEstados(rows) {
+      const set = new Set(); for (const r of rows) if (r.uf && r.uf.length) set.add(r.uf.toUpperCase());
+      return Array.from(set).sort((a,b)=>a.localeCompare(b));
+    }
+    function populateRamoSelect(ramos) {
+      ramoSelect.innerHTML = "";
+      for (const r of ramos) {
+        const opt = document.createElement('option'); opt.value = r; opt.textContent = r;
+        ramoSelect.appendChild(opt);
+      }
+    }
+    function populateEstadoMulti(estados) {
+      estadoMulti.innerHTML = "";
+      for (const e of estados) {
+        const opt = document.createElement('option'); opt.value = e; opt.textContent = e; opt.selected = true;
+        estadoMulti.appendChild(opt);
+      }
+    }
+    function selectedEstados() { return Array.from(estadoMulti.selectedOptions).map(o => o.value); }
+    function filterRows(ramo, estados, capitalsOnly) {
+      let rows = allRows.filter(x => x.ramo === ramo);
+      if (estados && estados.length) rows = rows.filter(x => !x.uf || estados.includes(x.uf.toUpperCase()));
+      if (hasCapital && capitalsOnly) rows = rows.filter(x => !!x.capital);
+      return rows;
+    }
+
+    function updateStats(rows){
+      const n = rows.length;
+      countLabel.textContent = n ? (n + " pts") : "— pts";
+      if (n){
+        let sum = 0;
+        for (const r of rows) sum += r.score;
+        avgLabel.textContent = "média " + (sum/n).toFixed(2);
+      } else {
+        avgLabel.textContent = "média —";
+      }
+    }
+
+    function updateDiscreteLegend(rows){
+      const n = rows.length || 1;
+      const counts = [0,0,0,0,0]; // 1..4
+      for (const r of rows) {
+        let k = Math.round(r.score);
+        if (k < 1) k = 1; if (k > 4) k = 4;
+        counts[k]++;
+      }
+      document.getElementById('pct1').textContent = Math.round(100*counts[1]/n) + "%";
+      document.getElementById('pct2').textContent = Math.round(100*counts[2]/n) + "%";
+      document.getElementById('pct3').textContent = Math.round(100*counts[3]/n) + "%";
+      document.getElementById('pct4').textContent = Math.round(100*counts[4]/n) + "%";
+      setDiscreteSwatches(isColorblind.checked);
+    }
+
+    function setLegendMode(useGrad){
+      if (useGrad){
+        legendGrad.style.setProperty('display','grid','important');
+        legendDisc.style.setProperty('display','none','important');
+      } else {
+        legendGrad.style.setProperty('display','none','important');
+        legendDisc.style.setProperty('display','block','important');
+        updateDiscreteLegend(lastRows);
+      }
+    }
+
+    function render(rows){
+      // guarda rows pra atualizar legendas mesmo sem re-render completo
+      lastRows = rows.slice();
+
+      nonCapLayer.clearLayers(); capLayer.clearLayers();
+      const latlngs = [];
+      const useGrad = isGradient.checked;
+      const palGrad = isColorblind.checked ? gradCB : gradNormal;
+      const palDisc = isColorblind.checked ? discCB : discNormal;
+
+      for (const p of rows) {
+        let fill;
+        if (useGrad) {
+          fill = palGrad(normRobust(p.score));
+        } else {
+          let k = Math.round(p.score); if (k<1) k=1; if (k>4) k=4;
+          fill = palDisc[k];
+        }
+        const baseOpts = { radius: pointRadius, fillColor: fill, fillOpacity: pointOpacity };
+        const tip = `${p.city || 'Cidade'}<br>Score: ${Number(p.score).toFixed(2)}<br>Ramo: ${p.ramo}${p.uf ? `<br>UF: ${p.uf}`:''}${p.capital ? `<br><b>Capital</b>`:''}`;
+        if (p.capital){
+          L.circleMarker([p.lat, p.lon], Object.assign({pane:'capitals', color:'#111827', weight:1.6}, baseOpts)).bindTooltip(tip).addTo(capLayer);
+        } else {
+          L.circleMarker([p.lat, p.lon], Object.assign({pane:'noncap', color:'#ffffff', weight:1}, baseOpts)).bindTooltip(tip).addTo(nonCapLayer);
+        }
+        latlngs.push([p.lat, p.lon]);
+      }
+      capLayer.bringToFront();
+
+      if (latlngs.length) {
+        const bounds = L.latLngBounds(latlngs);
+        map.fitBounds(bounds, { padding: [18,18] });
+      }
+      updateStats(rows);
+      setLegendMode(useGrad);
+    }
+
+    // ================== Eventos ==================
+    document.getElementById('btnSelTodos').addEventListener('click', (e) => {
+      e.preventDefault();
+      Array.from(estadoMulti.options).forEach(o => o.selected = true);
+      const rows = filterRows(ramoSelect.value, selectedEstados(), capitaisOnly.checked);
+      render(rows);
+    });
+    document.getElementById('btnLimpar').addEventListener('click', (e) => {
+      e.preventDefault();
+      Array.from(estadoMulti.options).forEach(o => o.selected = false);
+      const rows = filterRows(ramoSelect.value, selectedEstados(), capitaisOnly.checked);
+      render(rows);
+    });
+    sizeRange.addEventListener('input', e => {
+      pointRadius = parseInt(e.target.value, 10) || 8;
+      const rows = filterRows(ramoSelect.value, selectedEstados(), capitaisOnly.checked);
+      render(rows);
+    });
+    capitaisOnly.addEventListener('change', () => {
+      const rows = filterRows(ramoSelect.value, selectedEstados(), capitaisOnly.checked);
+      render(rows);
+    });
+    estadoMulti.addEventListener('change', () => {
+      const rows = filterRows(ramoSelect.value, selectedEstados(), capitaisOnly.checked);
+      render(rows);
+    });
+    ramoSelect.addEventListener('change', () => {
+      const rows = filterRows(ramoSelect.value, selectedEstados(), capitaisOnly.checked);
+      render(rows);
+    });
+    isGradient.addEventListener('change', () => {
+      setGradBar(isColorblind.checked);
+      setLegendMode(isGradient.checked); // troca instantânea da legenda
+      const rows = filterRows(ramoSelect.value, selectedEstados(), capitaisOnly.checked);
+      render(rows);
+    });
+    isColorblind.addEventListener('change', () => {
+      setGradBar(isColorblind.checked);
+      setDiscreteSwatches(isColorblind.checked);
+      const rows = filterRows(ramoSelect.value, selectedEstados(), capitaisOnly.checked);
+      render(rows);
+    });
+
+    // ================== CSV ==================
+    fileInput.addEventListener('change', evt => {
+      const file = evt.target.files[0];
+      if (!file) return;
+      Papa.parse(file, {
+        header: true, dynamicTyping: true, skipEmptyLines: true,
+        complete: res => {
+          const rows = parseRows(res.data);
+          if (!rows.length) { alert("CSV sem linhas válidas. Exige: city, lat, lon, score, ramo, uf (opcional capital)."); return; }
+          allRows = rows;
+
+          const ramos = computeRamos(allRows);
+          if (!ramos.length) { alert("Nenhum 'ramo' encontrado no CSV."); return; }
+          populateRamoSelect(ramos); ramoSelect.disabled = false;
+
+          const estados = computeEstados(allRows);
+          populateEstadoMulti(estados);
+
+          hasCapital = allRows.some(r => r.capital === true);
+          capitaisOnly.disabled = !hasCapital;
+          if (!hasCapital) capitaisOnly.checked = false;
+
+          updateDomain(allRows);
+          setGradBar(isColorblind.checked);
+          setDiscreteSwatches(isColorblind.checked);
+
+          ramoSelect.value = ramos[0];
+          const initial = filterRows(ramos[0], selectedEstados(), capitaisOnly.checked);
+          render(initial);
+        },
+        error: err => alert("Erro ao ler CSV: " + (err && err.message ? err.message : err))
+      });
+    });
+  </script>
+</body>
+</html>
