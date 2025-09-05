@@ -1,0 +1,307 @@
+
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mapa (CSV local) — Compacto por Ramo</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- PapaParse -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial; }
+
+    /* Compact panel */
+    .panel {
+      position: fixed; z-index: 9999;
+      background: rgba(255,255,255,0.92);
+      border: 1px solid rgba(148,163,184,0.35);
+      border-radius: 10px;
+      box-shadow: 0 8px 18px rgba(0,0,0,0.12);
+      padding: 8px 10px;
+    }
+    #controls {
+      top: 12px; left: 12px; width: min(300px, 92vw);
+      display: grid; gap: 8px;
+    }
+    label { font-size: 12px; color: #475569; }
+    select, input[type="file"], input[type="range"], button.tiny {
+      font-size: 13px; padding: 6px 8px; border-radius: 8px; border: 1px solid #e5e7eb;
+      background: #fff;
+    }
+    button.tiny { font-size: 11px; padding: 2px 6px; }
+    .row { display: grid; gap: 6px; }
+    .row-inline { display:flex; align-items:center; gap: 8px; flex-wrap: wrap; }
+    .muted { color: #6b7280; font-size: 12px; }
+    .hr { height: 1px; background: #e5e7eb; margin: 2px 0; }
+
+    /* Percent-only legend */
+    #legend {
+      bottom: 12px; left: 12px; display: grid; gap: 6px;
+    }
+    .pill {
+      display:inline-flex; align-items:center; gap:6px; padding: 2px 8px;
+      border-radius: 999px; background: #f1f5f9; color: #0f172a; font-size: 12px;
+      border: 1px solid rgba(148,163,184,0.35);
+    }
+    .swatch { width: 10px; height: 10px; border-radius: 999px; display:inline-block; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="controls" class="panel">
+    <div class="row">
+      <label>Carregar CSV (<code>city, lat, lon, score, ramo, uf</code>)</label>
+      <input id="fileInput" type="file" accept=".csv" />
+      <div class="muted">Após carregar, escolha o ramo e (opcional) estados.</div>
+    </div>
+
+    <div class="row">
+      <label>Ramo</label>
+      <select id="ramoSelect" disabled></select>
+    </div>
+
+    <div class="row state-row" style="display:none;">
+      <div class="row-inline" style="justify-content: space-between;">
+        <label>Estados</label>
+        <div class="row-inline" style="gap:6px;">
+          <button id="btnSelTodos" class="tiny">Selecionar todos</button>
+          <button id="btnLimpar" class="tiny">Limpar</button>
+        </div>
+      </div>
+      <select id="estadoMulti" multiple size="6" style="width:100%;"></select>
+    </div>
+
+    <div class="row-inline">
+      <label for="sizeRange" class="muted">Tamanho</label>
+      <input id="sizeRange" type="range" min="3" max="12" value="7" />
+      <span id="countLabel" class="muted" style="margin-left:auto;">— pts</span>
+      <span id="avgLabel" class="muted">média —</span>
+    </div>
+  </div>
+
+  <div id="legend" class="panel">
+    <div class="row-inline">
+      <span class="pill"><span class="swatch" style="background:#3b82f6"></span><span id="p1">—%</span></span>
+      <span class="pill"><span class="swatch" style="background:#22c55e"></span><span id="p2">—%</span></span>
+      <span class="pill"><span class="swatch" style="background:#f59e0b"></span><span id="p3">—%</span></span>
+      <span class="pill"><span class="swatch" style="background:#ef4444"></span><span id="p4">—%</span></span>
+    </div>
+  </div>
+
+  <script>
+    // Fixed config
+    const SCORE_COLORS = {1:"#3b82f6", 2:"#22c55e", 3:"#f59e0b", 4:"#ef4444"};
+    const colorFor = s => SCORE_COLORS[s] || "#6b7280";
+    let pointRadius = 7;
+    const pointOpacity = 0.9; // fixed
+
+    // Map with fixed Carto Light basemap
+    const map = L.map('map', { zoomControl: true, preferCanvas: true }).setView([-14.2350, -51.9253], 4);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; OpenStreetMap &copy; CARTO', subdomains: 'abcd', maxZoom: 20
+    }).addTo(map);
+    const layer = L.layerGroup().addTo(map);
+
+    // State
+    let allRows = [];      // original rows
+    let currentRows = [];  // filtered rows
+    let lastBounds = null;
+    let markers = [];
+    let hasEstado = false;
+
+    // UI refs
+    const fileInput = document.getElementById('fileInput');
+    const ramoSelect = document.getElementById('ramoSelect');
+    const estadoMulti = document.getElementById('estadoMulti');
+    const stateRow = document.querySelector('.state-row');
+    const btnSelTodos = document.getElementById('btnSelTodos');
+    const btnLimpar = document.getElementById('btnLimpar');
+    const sizeRange = document.getElementById('sizeRange');
+    const countLabel = document.getElementById('countLabel');
+    const avgLabel = document.getElementById('avgLabel');
+    const p1 = document.getElementById('p1'), p2 = document.getElementById('p2'), p3 = document.getElementById('p3'), p4 = document.getElementById('p4');
+
+    function normalizeKeys(row) {
+      const m = {};
+      Object.keys(row).forEach(k => {
+        const lk = (k || '').toString().trim().toLowerCase();
+        if (["lat","latitude"].includes(lk)) m.lat = row[k];
+        else if (["lon","lng","longitude"].includes(lk)) m.lon = row[k];
+        else if (["city","cidade","municipio","city_name"].includes(lk)) m.city = row[k];
+        else if (["score","pontuacao","nivel_medio"].includes(lk)) m.score = row[k];
+        else if (["ramo","segmento","setor","branch"].includes(lk)) m.ramo = row[k];
+        else if (["estado","uf","state","sigla_uf"].includes(lk)) m.uf = row[k];
+      });
+      return m;
+    }
+
+    function parseRows(raw) {
+      const out = [];
+      for (const r of raw) {
+        const o = normalizeKeys(r);
+        const lat = parseFloat(o.lat), lon = parseFloat(o.lon);
+        let score = parseInt(o.score);
+        const ramo = (o.ramo ?? '').toString().trim();
+        const city = (o.city ?? '').toString().trim();
+        const uf = (o.uf ?? '').toString().trim().toUpperCase();
+        if (Number.isFinite(lat) && Number.isFinite(lon) && Number.isFinite(score) && ramo) {
+          score = Math.max(1, Math.min(4, Math.round(score)));
+          out.push({city, lat, lon, score, ramo, uf});
+        }
+      }
+      return out;
+    }
+
+    function computeRamos(rows) {
+      const set = new Set();
+      for (const r of rows) if (r.ramo) set.add(r.ramo);
+      return Array.from(set).sort((a,b)=>a.localeCompare(b));
+    }
+
+    function computeEstados(rows) {
+      const set = new Set();
+      for (const r of rows) {
+        if (r.uf && r.uf.length) set.add(r.uf.toUpperCase());
+      }
+      // sort with SP, RJ, MG, RS near top? Keep alpha for simplicity:
+      return Array.from(set).sort((a,b)=>a.localeCompare(b));
+    }
+
+    function populateRamoSelect(ramos) {
+      ramoSelect.innerHTML = "";
+      for (const r of ramos) {
+        const opt = document.createElement('option');
+        opt.value = r; opt.textContent = r;
+        ramoSelect.appendChild(opt);
+      }
+    }
+
+    function populateEstadoMulti(estados) {
+      estadoMulti.innerHTML = "";
+      for (const e of estados) {
+        const opt = document.createElement('option');
+        opt.value = e; opt.textContent = e;
+        opt.selected = true; // default: all selected
+        estadoMulti.appendChild(opt);
+      }
+    }
+
+    function selectedEstados() {
+      return Array.from(estadoMulti.selectedOptions).map(o => o.value);
+    }
+
+    function filterRows(ramo, estados) {
+      let rows = allRows.filter(x => x.ramo === ramo);
+      if (hasEstado && estados && estados.length) {
+        rows = rows.filter(x => estados.includes((x.uf || '').toUpperCase()));
+      }
+      return rows;
+    }
+
+    function updateLegendAndStats(rows){
+      const n = rows.length;
+      const counts = [0,0,0,0,0]; // 1..4
+      let sum = 0;
+      for (const r of rows) { counts[r.score]++; sum += r.score; }
+      const toPct = k => n ? Math.round(100*counts[k]/n) + "%" : "—%";
+      p1.textContent = toPct(1);
+      p2.textContent = toPct(2);
+      p3.textContent = toPct(3);
+      p4.textContent = toPct(4);
+      countLabel.textContent = n ? (n + " pts") : "— pts";
+      avgLabel.textContent = n ? ("média " + (sum/n).toFixed(2)) : "média —";
+    }
+
+    function render(rows){
+      layer.clearLayers();
+      markers = [];
+      const latlngs = [];
+      for (const p of rows) {
+        const marker = L.circleMarker([p.lat, p.lon], {
+          radius: pointRadius, color: "#ffffff", weight: 1,
+          fillColor: colorFor(p.score), fillOpacity: pointOpacity
+        }).bindTooltip(`${p.city || 'Cidade'}<br>Score: ${p.score}<br>Ramo: ${p.ramo}${p.uf ? `<br>UF: ${p.uf}` : ''}`);
+        marker.addTo(layer);
+        markers.push(marker);
+        latlngs.push([p.lat, p.lon]);
+      }
+      if (latlngs.length) {
+        lastBounds = L.latLngBounds(latlngs);
+        map.fitBounds(lastBounds, { padding: [18,18] });
+      }
+      updateLegendAndStats(rows);
+    }
+
+    // Events
+    fileInput.addEventListener('change', evt => {
+      const file = evt.target.files[0];
+      if (!file) return;
+      Papa.parse(file, {
+        header: true, dynamicTyping: true, skipEmptyLines: true,
+        complete: res => {
+          const parsed = parseRows(res.data);
+          if (!parsed.length) { alert("CSV sem linhas válidas. Exige: city, lat, lon, score, ramo (e uf para filtrar por estado)."); return; }
+          allRows = parsed;
+          const ramos = computeRamos(allRows);
+          if (!ramos.length) { alert("Nenhum 'ramo' encontrado no CSV."); return; }
+          populateRamoSelect(ramos);
+          ramoSelect.disabled = false;
+
+          // Estado filter (optional)
+          const estados = computeEstados(allRows);
+          hasEstado = estados.length > 0;
+          if (hasEstado) {
+            populateEstadoMulti(estados);
+            stateRow.style.display = "";
+          } else {
+            stateRow.style.display = "none";
+          }
+
+          // auto-select first ramo and render with states (all selected by default)
+          ramoSelect.value = ramos[0];
+          currentRows = filterRows(ramos[0], hasEstado ? selectedEstados() : null);
+          render(currentRows);
+        },
+        error: err => alert("Erro ao ler CSV: " + (err && err.message ? err.message : err))
+      });
+    });
+
+    ramoSelect.addEventListener('change', () => {
+      currentRows = filterRows(ramoSelect.value, hasEstado ? selectedEstados() : null);
+      render(currentRows);
+    });
+
+    estadoMulti.addEventListener('change', () => {
+      currentRows = filterRows(ramoSelect.value, selectedEstados());
+      render(currentRows);
+    });
+
+    btnSelTodos.addEventListener('click', (e) => {
+      e.preventDefault();
+      Array.from(estadoMulti.options).forEach(o => o.selected = true);
+      currentRows = filterRows(ramoSelect.value, selectedEstados());
+      render(currentRows);
+    });
+
+    btnLimpar.addEventListener('click', (e) => {
+      e.preventDefault();
+      Array.from(estadoMulti.options).forEach(o => o.selected = false);
+      currentRows = filterRows(ramoSelect.value, []);
+      render(currentRows);
+    });
+
+    sizeRange.addEventListener('input', e => {
+      pointRadius = parseInt(e.target.value, 10) || 7;
+      markers.forEach(m => m.setStyle({radius: pointRadius}));
+    });
+  </script>
+</body>
+</html>
